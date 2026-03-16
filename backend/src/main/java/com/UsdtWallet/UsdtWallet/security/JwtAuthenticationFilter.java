@@ -1,0 +1,155 @@
+package com.UsdtWallet.UsdtWallet.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
+
+import com.UsdtWallet.UsdtWallet.service.AuthTokenService;
+import com.UsdtWallet.UsdtWallet.repository.UserRepository;
+import com.UsdtWallet.UsdtWallet.model.entity.User;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtTokenProvider tokenProvider;
+    private final UserDetailsService userDetailsService;
+    private final AuthTokenService authTokenService;
+    private final UserRepository userRepository;
+
+    // Public endpoints that should skip JWT authentication
+    private static final List<String> PUBLIC_PATHS = Arrays.asList(
+        "/api/auth/register",
+        "/api/auth/login",
+        "/api/auth/refresh",
+        "/api/auth/verify-email",
+        "/api/auth/resend-verification",
+        "/api/auth/check-username",
+        "/api/auth/check-email",
+        "/api/auth/create-admin",
+        "/api/auth/forgot-password",
+        "/api/auth/reset-password",
+        "/api/admin/wallet/",
+        "/api/notifications/stream",
+        "/api/test/",
+        "/actuator/",
+        "/health",
+        "/favicon.ico",
+        "/.well-known/"
+    );
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+
+        String requestPath = request.getRequestURI();
+        log.debug("Processing request: {} {}", request.getMethod(), requestPath);
+
+        // Skip JWT processing for public endpoints
+        if (isPublicPath(requestPath)) {
+            log.debug("Skipping JWT authentication for public path: {}", requestPath);
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        try {
+            String jwt = getJwtFromRequest(request);
+            
+            // ✅ FIX: For SSE endpoint, try to get token from query parameter
+            if (!StringUtils.hasText(jwt) && requestPath.contains("/notifications/stream")) {
+                jwt = request.getParameter("token");
+                log.debug("SSE endpoint - JWT from query param: {}", jwt != null ? "Yes" : "No");
+            }
+            
+            log.info("🔍 JWT Debug - Path: {}, Token found: {}", requestPath, jwt != null ? "Yes" : "No");
+
+            if (StringUtils.hasText(jwt) && tokenProvider.validateToken(jwt)) {
+                // Check blacklist (logout)
+                if (authTokenService.isBlacklisted(jwt)) {
+                    log.warn("🚫 Token is blacklisted for path: {}", requestPath);
+                    filterChain.doFilter(request, response);
+                    return;
+                }
+
+                String username = tokenProvider.getUsernameFromToken(jwt);
+                log.info("🔓 JWT validated, username: {}", username);
+
+                // Enforce password reset logout
+                try {
+                    User userEntity = userRepository.findByUsername(username).orElse(null);
+                    if (userEntity != null && userEntity.getPasswordChangedAt() != null) {
+                        Date iat = tokenProvider.getIssuedAtDate(jwt);
+                        if (iat == null || iat.toInstant().isBefore(userEntity.getPasswordChangedAt().atZone(java.time.ZoneId.systemDefault()).toInstant())) {
+                            log.warn("⏰ Token issued before password change for: {}", username);
+                            filterChain.doFilter(request, response);
+                            return;
+                        }
+                    }
+                } catch (Exception ignored) { }
+
+                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+                log.debug("UserDetails loaded for: {}", userDetails.getUsername());
+
+                // Cast về UserPrincipal để đảm bảo @AuthenticationPrincipal hoạt động
+                UserPrincipal userPrincipal = (UserPrincipal) userDetails;
+                log.info("👤 User authorities: {}", userPrincipal.getAuthorities());
+
+                UsernamePasswordAuthenticationToken authentication =
+                        new UsernamePasswordAuthenticationToken(
+                                userPrincipal, null, userPrincipal.getAuthorities());
+                authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+                log.info("✅ Authentication set for user: {} with roles: {}", username, userPrincipal.getAuthorities());
+            } else {
+                log.warn("❌ Invalid or missing JWT token for path: {}", requestPath);
+            }
+
+        } catch (Exception e) {
+            log.error("Could not set user authentication in security context for path: {}", requestPath, e);
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    private boolean isPublicPath(String path) {
+        boolean isPublic = PUBLIC_PATHS.stream().anyMatch(publicPath -> {
+            if (publicPath.endsWith("/")) {
+                return path.startsWith(publicPath);
+            } else if (path.equals(publicPath)) {
+                return true;
+            } else {
+                // Also match sub-paths for things like /api/jobs/{id}
+                return path.startsWith(publicPath + "/");
+            }
+        });
+        log.debug("Path {} is public: {}", path, isPublic);
+        return isPublic;
+    }
+
+    private String getJwtFromRequest(HttpServletRequest request) {
+        String bearerToken = request.getHeader("Authorization");
+        if (StringUtils.hasText(bearerToken) && bearerToken.startsWith("Bearer ")) {
+            return bearerToken.substring(7);
+        }
+        return null;
+    }
+}

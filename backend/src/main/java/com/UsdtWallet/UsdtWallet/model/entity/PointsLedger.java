@@ -1,0 +1,103 @@
+package com.UsdtWallet.UsdtWallet.model.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Entity
+@Table(name = "points_ledger")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class PointsLedger {
+
+    @Id
+    // Keep UUID string primary key to remain compatible with existing data
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "id", length = 36, updatable = false, nullable = false)
+    private String id;
+
+    // UUID user reference
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
+
+    // Reference to wallet_transactions(id)
+    @Column(name = "wallet_transaction_id")
+    private Long walletTransactionId;
+
+    // Optional reference to withdrawal_transactions(id)
+    @Column(name = "withdrawal_id")
+    private Long withdrawalId;
+
+    // Kept for business idempotency (previous logical transaction identifier)
+    @Column(name = "transaction_id")
+    private String transactionId;
+
+    @Column(name = "reference_id")
+    private String referenceId; // For P2P transfers
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "transaction_type", nullable = false)
+    private PointsTransactionType transactionType;
+
+    @Column(name = "amount", precision = 36, scale = 18, nullable = false)
+    private BigDecimal amount;
+
+    @Column(name = "balance_before", precision = 36, scale = 18, nullable = false)
+    private BigDecimal balanceBefore;
+
+    @Column(name = "balance_after", precision = 36, scale = 18, nullable = false)
+    private BigDecimal balanceAfter;
+
+    @Column(name = "from_user_id")
+    private UUID fromUserId; // For P2P transfers
+
+    @Column(name = "to_user_id")
+    private UUID toUserId; // For P2P transfers
+
+    @Column(name = "description")
+    private String description;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false)
+    private PointsTransactionStatus status;
+
+    @Column(name = "usdt_amount", precision = 36, scale = 18)
+    private BigDecimal usdtAmount; // Original USDT amount for deposits
+
+    @Column(name = "exchange_rate", precision = 18, scale = 8)
+    private BigDecimal exchangeRate; // USDT to Points rate
+
+    @CreationTimestamp
+    @Column(name = "created_at")
+    private LocalDateTime createdAt;
+
+    public enum PointsTransactionType {
+        DEPOSIT_CREDIT,    // USDT deposit → Points
+        P2P_SEND,         // Send points to another user
+        P2P_RECEIVE,      // Receive points from another user
+        WITHDRAWAL_DEBIT, // Points → USDT withdrawal
+        ESCROW_LOCK,      // 🆕 Lock funds for project
+        ESCROW_RELEASE,   // 🆕 Release funds to freelancer
+        ESCROW_REFUND,    // 🆕 Refund to employer (if project cancelled)
+        ADJUSTMENT,       // Manual adjustment by admin
+        BONUS,           // Promotional bonus
+        PLATFORM_FEE_COLLECTION, // 🆕 Platform fee from transactions
+        REFUND           // Refund transaction
+    }
+
+    public enum PointsTransactionStatus {
+        PENDING,
+        COMPLETED,
+        FAILED,
+        CANCELLED
+    }
+}

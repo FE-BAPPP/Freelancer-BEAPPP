@@ -1,0 +1,25 @@
+làm lại phiếu giao đồ án 
+sửa lại mục lục sửa lại phông chữ 
+caption ảnh, mục lục header, footer sửa lại phông chữ 
+Phần 2 Phân tích và thiết kế xử lý
+Phân tích hệ thống, Phân tích cài đặt
+kết luận chung 
+là đánh giá rồi, chỉ 1 cái thôi
+trình bày các thuật ngữ ngay từ đầu
+Về nội dung
+danh mục hình ảnh sửa lại
+Đồ án TN thực hiện hoạt động xây dựng hệ thống tìm việc Online
+chỉ giữ phần 5
+I. cơ sở thực tiễn, căn lề đều 2 bên, đang bị căn trái
+Dùng cái từ biểu cảm, phải sửa lại, đây là công trình của mình, văn phong của mình trình bày về khoa học cho giáo viên, svien(tôi lựa chọn), 
+sửa lại chính tả, đồng bộ lại front chữ, thuật ngữ trong đồ án thì cần phải có bảng thuật ngữ trên đầu, bảng các từ viết tắt USDT
+định nghĩa lại cột mốc, escrow, danh mục từ viết tắt. Cho thuật ngữ đấy cho thầy cô giáo, định nghĩa cả các cái trạng thái, status, bảng trạng thái,
+ Trong quá trình đăng tuyển dụng, trong đính kèm file mũi tên extend ngược lại về đăng tuyển dụng
+mũi tên extend đi ngược lại
+UC thực hiện cột mốc chỉ có 1 UC thôi, sửa lại là cập nhật tiến trình công việc
+tách ra làm 2 cái UC khác nhau, Đóng Job, Cập nhât Job, 
+hành vi của hệ thống thì bỏ ra khỏi sequence, cái sequence không cần tường minh quá đâu
+sơ đồi sequence, sequence sửa lại thuộc tính, sửa lại cái phần method sinh từ ai đó, vì luồng không đi theo luồng mình mô tả, 
+Tổng quan use case, class sơ đồ, căn cứ vào class thì mới sinh ERD
+phần cở sở dữ liệu là phần thiết kế 
+

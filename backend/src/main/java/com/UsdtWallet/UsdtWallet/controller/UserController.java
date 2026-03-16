@@ -1,0 +1,589 @@
+package com.UsdtWallet.UsdtWallet.controller;
+
+import com.UsdtWallet.UsdtWallet.model.dto.request.UserRegistrationRequest;
+import com.UsdtWallet.UsdtWallet.model.dto.request.LoginRequest;
+import com.UsdtWallet.UsdtWallet.model.dto.request.UpdateProfileRequest;
+import com.UsdtWallet.UsdtWallet.model.dto.response.ApiResponse;
+import com.UsdtWallet.UsdtWallet.model.dto.response.UserRegistrationResponse;
+import com.UsdtWallet.UsdtWallet.model.entity.User;
+import com.UsdtWallet.UsdtWallet.security.UserPrincipal;
+import com.UsdtWallet.UsdtWallet.service.UserService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+import com.UsdtWallet.UsdtWallet.service.AuthTokenService;
+import com.UsdtWallet.UsdtWallet.security.JwtTokenProvider;
+import com.UsdtWallet.UsdtWallet.security.CustomUserDetailsService;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.util.StringUtils;
+import jakarta.servlet.http.HttpServletRequest;
+import com.UsdtWallet.UsdtWallet.service.EmailService;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.userdetails.UserDetails;
+
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+@Slf4j
+public class UserController {
+
+    private final UserService userService;
+    private final AuthTokenService authTokenService;
+    private final JwtTokenProvider jwtTokenProvider;
+    private final PasswordEncoder passwordEncoder;
+    private final EmailService emailService;
+    private final CustomUserDetailsService customUserDetailsService;
+
+    @Value("${spring.security.jwt.expiration:86400000}")
+    private Long jwtExpirationInMs; // added
+
+    /**
+     * User registration with auto wallet assignment
+     */
+    @PostMapping("/register")
+    public ResponseEntity<ApiResponse<UserRegistrationResponse>> registerUser(
+            @Valid @RequestBody UserRegistrationRequest request) {
+        try {
+            log.info("=== STARTING USER REGISTRATION ===");
+            log.info("Request received for username: {}, email: {}", request.getUsername(), request.getEmail());
+
+            UserRegistrationResponse response = userService.registerUser(request);
+
+            log.info("=== USER REGISTRATION SUCCESSFUL ===");
+            log.info("User {} registered successfully with wallet {}",
+                response.getUsername(), response.getWalletAddress());
+
+            ApiResponse<UserRegistrationResponse> apiResponse = ApiResponse.success(
+                "User registered successfully with auto-assigned wallet", response);
+
+            log.info("Returning response: {}", apiResponse);
+            return ResponseEntity.ok(apiResponse);
+
+        } catch (Exception e) {
+            log.error("=== USER REGISTRATION FAILED ===");
+            log.error("Error details: ", e);
+
+            ApiResponse<UserRegistrationResponse> errorResponse = ApiResponse.<UserRegistrationResponse>builder()
+                .success(false)
+                .message("Registration failed: " + e.getMessage())
+                .data(null)
+                .build();
+
+            return ResponseEntity.badRequest().body(errorResponse);
+        }
+    }
+
+    /**
+     * User login
+     */
+    @PostMapping("/login")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> login(
+            @Valid @RequestBody LoginRequest request) {
+        try {
+            log.info("Login attempt for username: {}", request.getUsername());
+
+            Map<String, Object> response = userService.login(request.getUsername(), request.getPassword());
+
+            log.info("Login successful for user: {}", request.getUsername());
+            return ResponseEntity.ok(ApiResponse.success("Login successful", response));
+
+        } catch (Exception e) {
+            log.error("Login failed for username: {}", request.getUsername(), e);
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Login failed: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * Refresh access token using refresh token
+     * FR-01: Token Management - Refresh token endpoint
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> refreshToken(
+            @RequestBody Map<String, String> request) {
+        try {
+            String refreshToken = request.get("refreshToken");
+            
+            if (refreshToken == null || refreshToken.isEmpty()) {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("Refresh token is required")
+                        .build());
+            }
+            
+            // Validate refresh token
+            if (!jwtTokenProvider.validateToken(refreshToken)) {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("Invalid or expired refresh token")
+                        .build());
+            }
+            
+            // Get username from refresh token
+            String username = jwtTokenProvider.getUsernameFromToken(refreshToken);
+            
+            // Load user details
+            UserDetails userDetails = customUserDetailsService.loadUserByUsername(username);
+            
+            // Create authentication object
+            UsernamePasswordAuthenticationToken authentication = 
+                new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+            
+            // Generate new tokens
+            String newAccessToken = jwtTokenProvider.generateToken(authentication);
+            String newRefreshToken = jwtTokenProvider.generateRefreshToken(authentication);
+            
+            Map<String, Object> response = Map.of(
+                "accessToken", newAccessToken,
+                "refreshToken", newRefreshToken,
+                "tokenType", "Bearer",
+                "expiresIn", jwtExpirationInMs
+            );
+            
+            log.info("Token refreshed successfully for user: {}", username);
+            return ResponseEntity.ok(ApiResponse.success("Token refreshed successfully", response));
+            
+        } catch (Exception e) {
+            log.error("Token refresh failed: {}", e.getMessage(), e);
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Token refresh failed: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * FR-01: Verify email address with token
+     */
+    @PostMapping("/verify-email")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> verifyEmail(
+            @RequestBody Map<String, String> request) {
+        try {
+            String token = request.get("token");
+            
+            if (token == null || token.isEmpty()) {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("Verification token is required")
+                        .build());
+            }
+            
+            boolean verified = userService.verifyEmail(token);
+            
+            if (verified) {
+                return ResponseEntity.ok(ApiResponse.success("Email verified successfully", 
+                    Map.of("verified", true)));
+            } else {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("Invalid or expired verification token")
+                        .build());
+            }
+            
+        } catch (Exception e) {
+            log.error("Email verification failed: {}", e.getMessage(), e);
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Email verification failed: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * FR-01: Resend email verification
+     */
+    @PostMapping("/resend-verification")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> resendVerificationEmail(
+            @RequestBody Map<String, String> request) {
+        try {
+            String email = request.get("email");
+            
+            if (email == null || email.isEmpty()) {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("Email is required")
+                        .build());
+            }
+            
+            userService.resendVerificationEmail(email);
+            
+            return ResponseEntity.ok(ApiResponse.success("Verification email sent", 
+                Map.of("sent", true)));
+            
+        } catch (Exception e) {
+            log.error("Resend verification email failed: {}", e.getMessage(), e);
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Failed to resend verification email: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * Get current user profile
+     */
+    @GetMapping("/profile")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getUserProfile(
+            @AuthenticationPrincipal UserPrincipal userPrincipal) {
+        try {
+            Map<String, Object> userInfo = userService.getUserInfo(userPrincipal.getId().toString());
+            return ResponseEntity.ok(ApiResponse.success(userInfo));
+        } catch (Exception e) {
+            log.error("Error getting user profile", e);
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Failed to get profile: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * Get user wallet address and balance info
+     */
+    @GetMapping("/wallet")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getUserWallet(
+            @AuthenticationPrincipal UserPrincipal userPrincipal) {
+        try {
+            String walletAddress = userService.getUserWalletAddress(userPrincipal.getId());
+
+            if (walletAddress != null) {
+                Map<String, Object> result = userService.getUserWalletInfo(userPrincipal.getId());
+                
+                // ✅ FIX: Thêm address vào response
+                if (!result.containsKey("address")) {
+                    result.put("address", walletAddress);
+                }
+                if (!result.containsKey("walletAddress")) {
+                    result.put("walletAddress", walletAddress);
+                }
+                
+                return ResponseEntity.ok(ApiResponse.success(result));
+            } else {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("No wallet assigned to user")
+                        .build());
+            }
+
+        } catch (Exception e) {
+            log.error("Error getting user wallet: {}", e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Failed to get wallet info: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * Get user deposit address for QR code
+     * ✅ FIX: Allow all authenticated roles (USER, ADMIN, FREELANCER, EMPLOYER)
+     */
+    @GetMapping("/deposit-address")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getDepositAddress(
+            @AuthenticationPrincipal UserPrincipal userPrincipal) {
+        try {
+            // ✅ Get wallet address from user service (works for all roles)
+            String walletAddress = userService.getUserWalletAddress(userPrincipal.getId());
+
+            if (walletAddress == null || walletAddress.isEmpty()) {
+                return ResponseEntity.badRequest()
+                    .body(ApiResponse.<Map<String, Object>>builder()
+                        .success(false)
+                        .message("No wallet address assigned to this user")
+                        .build());
+            }
+
+            Map<String, Object> result = Map.of(
+                "userId", userPrincipal.getId().toString(),
+                "depositAddress", walletAddress,
+                "network", "TRC20",
+                "token", "USDT",
+                "note", "Only send USDT (TRC20) to this address"
+            );
+
+            return ResponseEntity.ok(ApiResponse.success(result));
+
+        } catch (Exception e) {
+            log.error("Error getting deposit address for user {}: {}", userPrincipal.getId(), e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Failed to get deposit address: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * Get user transaction history
+     */
+    @GetMapping("/transactions")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getUserTransactions(
+            @AuthenticationPrincipal UserPrincipal userPrincipal,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        try {
+            Map<String, Object> transactions = userService.getUserTransactions(
+                userPrincipal.getId(), page, size);
+
+            return ResponseEntity.ok(ApiResponse.success(transactions));
+
+        } catch (Exception e) {
+            log.error("Error getting user transactions: {}", e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Failed to get transactions: " + e.getMessage())
+                    .build());
+        }
+    }
+
+    /**
+     * Create admin account (one-time setup endpoint)
+     */
+    @PostMapping("/create-admin")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> createAdmin(
+            @RequestBody CreateAdminRequest request) {
+        try {
+            log.info("=== CREATE ADMIN REQUEST ===");
+            log.info("Username: {}", request.getUsername());
+            log.info("Email: {}", request.getEmail());
+
+            Map<String, Object> result = userService.createAdminAccount(
+                request.getUsername(),
+                request.getPassword(),
+                request.getEmail(),
+                request.getFullName()
+            );
+
+            log.info("Admin account created via API: {}", request.getUsername());
+
+            return ResponseEntity.ok(ApiResponse.success("Admin account created successfully", result));
+
+        } catch (Exception e) {
+            log.error("Failed to create admin account - Exception type: {}", e.getClass().getSimpleName());
+            log.error("Failed to create admin account - Message: {}", e.getMessage());
+            log.error("Failed to create admin account - Stack trace: ", e);
+            return ResponseEntity.badRequest()
+                .body(ApiResponse.<Map<String, Object>>builder()
+                    .success(false)
+                    .message("Failed to create admin account: " + (e.getMessage() != null ? e.getMessage() : "Unknown error"))
+                    .build());
+        }
+    }
+
+    /**
+     * User logout: blacklist current JWT until expiry
+     */
+    @PostMapping("/logout")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> logout(HttpServletRequest request) {
+        try {
+            String bearer = request.getHeader("Authorization");
+            if (!StringUtils.hasText(bearer) || !bearer.startsWith("Bearer ")) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Missing token").build());
+            }
+            String token = bearer.substring(7);
+            authTokenService.blacklistToken(token, jwtTokenProvider.getExpirationTime());
+            return ResponseEntity.ok(ApiResponse.success(Map.of("loggedOut", true)));
+        } catch (Exception e) {
+            log.error("Logout failed", e);
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Logout failed: " + e.getMessage()).build());
+        }
+    }
+
+    /**
+     * Forgot password: issue reset token (dev: return token in response)
+     */
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> forgotPassword(@RequestBody Map<String, String> body,
+                                                                           HttpServletRequest request) {
+        try {
+            String email = body.get("email");
+            if (!StringUtils.hasText(email)) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Email is required").build());
+            }
+
+            // Throttle per email and IP
+            String ip = request.getHeader("X-Forwarded-For");
+            if (ip != null && ip.contains(",")) {
+                ip = ip.split(",")[0].trim();
+            }
+            if (!StringUtils.hasText(ip)) {
+                ip = request.getRemoteAddr();
+            }
+            boolean allowed = authTokenService.acquireResetThrottle(email, ip);
+            if (!allowed) {
+                // Always generic response (non-enumerable)
+                try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+                return ResponseEntity.ok(ApiResponse.success(Map.of(
+                    "requested", true,
+                    "message", "If the email exists, we've sent reset instructions"
+                )));
+            }
+
+            // Avoid user enumeration
+            boolean exists = false;
+            try { exists = userService.existsByEmail(email); } catch (Exception ignored) {}
+
+            if (exists) {
+                try {
+                    User user = userService.getUserByEmail(email);
+                    String token = authTokenService.createPasswordResetTokenReplacingPrevious(
+                        user.getId().toString(), java.time.Duration.ofMinutes(15));
+                    emailService.sendPasswordResetEmail(email, token);
+                } catch (Exception sendEx) {
+                    log.warn("Failed to process password reset for {}: {}", email, sendEx.getMessage());
+                }
+            } else {
+                try { Thread.sleep(120); } catch (InterruptedException ignored) {}
+            }
+
+            return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "requested", true,
+                "message", "If the email exists, we've sent reset instructions"
+            )));
+        } catch (Exception e) {
+            log.error("Forgot password failed", e);
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Forgot password failed").build());
+        }
+    }
+
+    /**
+     * Reset password with token
+     */
+    @PostMapping("/reset-password")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> resetPassword(@RequestBody Map<String, String> body) {
+        try {
+            String token = body.get("token");
+            String newPassword = body.get("newPassword");
+            if (!StringUtils.hasText(token) || !StringUtils.hasText(newPassword)) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Token and newPassword are required").build());
+            }
+            String userId = authTokenService.validateResetToken(token);
+            if (!StringUtils.hasText(userId)) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Invalid or expired token").build());
+            }
+            boolean updated = userService.updatePassword(java.util.UUID.fromString(userId), passwordEncoder.encode(newPassword));
+            if (updated) {
+                authTokenService.consumeResetToken(token);
+                return ResponseEntity.ok(ApiResponse.success(Map.of("reset", true)));
+            }
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Failed to reset password").build());
+        } catch (Exception e) {
+            log.error("Reset password failed", e);
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Reset password failed: " + e.getMessage()).build());
+        }
+    }
+
+    /**
+     * Update profile fields
+     */
+    @PutMapping("/profile")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> updateProfile(
+            @AuthenticationPrincipal UserPrincipal userPrincipal,
+            @RequestBody UpdateProfileRequest req) {
+        try {
+            Map<String, Object> updated = userService.updateProfile(userPrincipal.getId(), req);
+            return ResponseEntity.ok(ApiResponse.success("Profile updated", updated));
+        } catch (Exception e) {
+            log.error("Update profile failed", e);
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder().success(false).message("Update profile failed: " + e.getMessage()).build());
+        }
+    }
+
+    /**
+     * Upload avatar image
+     * FR-01: Avatar Upload System
+     */
+    @PostMapping("/avatar")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> uploadAvatar(
+            @AuthenticationPrincipal UserPrincipal userPrincipal,
+            @RequestParam("file") org.springframework.web.multipart.MultipartFile file) {
+        try {
+            // Validate file
+            if (file.isEmpty()) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder()
+                    .success(false).message("Please select an image file").build());
+            }
+            
+            // Validate file type (only images)
+            String contentType = file.getContentType();
+            if (contentType == null || !contentType.startsWith("image/")) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder()
+                    .success(false).message("Only image files are allowed").build());
+            }
+            
+            // Validate file size (max 5MB)
+            if (file.getSize() > 5 * 1024 * 1024) {
+                return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder()
+                    .success(false).message("File size must be less than 5MB").build());
+            }
+            
+            String avatarUrl = userService.uploadAvatar(userPrincipal.getId(), file);
+            
+            return ResponseEntity.ok(ApiResponse.success("Avatar uploaded successfully", 
+                Map.of("avatarUrl", avatarUrl)));
+        } catch (Exception e) {
+            log.error("Avatar upload failed", e);
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder()
+                .success(false).message("Avatar upload failed: " + e.getMessage()).build());
+        }
+    }
+
+    /**
+     * Delete avatar
+     */
+    @DeleteMapping("/avatar")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteAvatar(
+            @AuthenticationPrincipal UserPrincipal userPrincipal) {
+        try {
+            userService.deleteAvatar(userPrincipal.getId());
+            return ResponseEntity.ok(ApiResponse.success("Avatar deleted", Map.of("deleted", true)));
+        } catch (Exception e) {
+            log.error("Avatar delete failed", e);
+            return ResponseEntity.badRequest().body(ApiResponse.<Map<String,Object>>builder()
+                .success(false).message("Avatar delete failed: " + e.getMessage()).build());
+        }
+    }
+
+    // DTO class for admin creation request
+    public static class CreateAdminRequest {
+        private String username;
+        private String password;
+        private String email;
+        private String fullName;
+
+        // Getters and setters
+        public String getUsername() { return username; }
+        public void setUsername(String username) { this.username = username; }
+
+        public String getPassword() { return password; }
+        public void setPassword(String password) { this.password = password; }
+
+        public String getEmail() { return email; }
+        public void setEmail(String email) { this.email = email; }
+
+        public String getFullName() { return fullName; }
+        public void setFullName(String fullName) { this.fullName = fullName; }
+    }
+}

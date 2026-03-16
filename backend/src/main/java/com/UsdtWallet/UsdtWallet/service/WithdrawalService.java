@@ -1,0 +1,280 @@
+﻿package com.UsdtWallet.UsdtWallet.service;
+
+import com.UsdtWallet.UsdtWallet.model.entity.WithdrawalTransaction;
+import com.UsdtWallet.UsdtWallet.model.entity.User;
+import com.UsdtWallet.UsdtWallet.repository.WithdrawalTransactionRepository;
+import com.UsdtWallet.UsdtWallet.repository.UserRepository;
+import com.UsdtWallet.UsdtWallet.model.dto.request.WithdrawalConfirmRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class WithdrawalService {
+
+    private final WithdrawalTransactionRepository withdrawalRepository;
+    private final UserRepository userRepository;
+    private final PointsService pointsService;
+    private final PasswordEncoder passwordEncoder;
+    private final WithdrawalQueueService withdrawalQueueService;
+    private final TwoFactorAuthService twoFactorAuthService;
+
+    @Value("${withdrawal.fee.fixed:1.0}")
+    private BigDecimal fixedFee;
+
+    @Value("${withdrawal.fee.percentage:0.001}")
+    private BigDecimal feePercentage;
+
+    @Value("${withdrawal.min.amount:1.0}")
+    private BigDecimal minWithdrawalAmount;
+
+    @Value("${withdrawal.max.amount:100000.0}")
+    private BigDecimal maxWithdrawalAmount;
+
+    @Value("${withdrawal.daily.limit:50000.0}")
+    private BigDecimal dailyLimit;
+
+    @Value("${withdrawal.queue.delay-seconds:60}")
+    private long confirmQueueDelaySeconds;
+
+    
+    @Transactional
+    public WithdrawalTransaction createWithdrawal(UUID userId, com.UsdtWallet.UsdtWallet.model.dto.request.WithdrawalCreateRequest request) {
+        log.info("Creating withdrawal for user: {}, amount: {}", userId, request.getAmount());
+
+        User user = userRepository.findById(userId)
+            .orElseThrow(() -> new RuntimeException("User not found"));
+
+        if (user.getWithdrawalsDisabledUntil() != null && LocalDateTime.now().isBefore(user.getWithdrawalsDisabledUntil())) {
+            throw new RuntimeException("Withdrawals are temporarily disabled until " + user.getWithdrawalsDisabledUntil() + " due to a recent security change.");
+        }
+
+        validateWithdrawalLimits(userId, request.getAmount());
+
+        BigDecimal fee = calculateFee(request.getAmount());
+        BigDecimal netAmount = request.getAmount().subtract(fee);
+        if (netAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new RuntimeException("Amount after fee must be positive");
+        }
+
+        WithdrawalTransaction withdrawal = WithdrawalTransaction.builder()
+            .userId(userId)
+            .toAddress(request.getToAddress())
+            .amount(request.getAmount())
+            .fee(fee)
+            .netAmount(netAmount)
+            .status(WithdrawalTransaction.WithdrawalStatus.PENDING)
+            .build();
+
+        withdrawal = withdrawalRepository.save(withdrawal);
+
+        log.info("Withdrawal PENDING (awaiting confirm): ID={}, Amount={}, Fee={}",
+            withdrawal.getId(), withdrawal.getAmount(), withdrawal.getFee());
+
+        return withdrawal;
+    }
+
+    
+    @Transactional
+    public Map<String, Object> confirmWithdrawal(UUID userId, WithdrawalConfirmRequest req) {
+        User user = userRepository.findById(userId)
+            .orElseThrow(() -> new RuntimeException("User not found"));
+
+        WithdrawalTransaction withdrawal = withdrawalRepository.findByIdAndUserId(req.getWithdrawalId(), userId)
+            .orElseThrow(() -> new RuntimeException("Withdrawal not found"));
+
+        if (withdrawal.getStatus() != WithdrawalTransaction.WithdrawalStatus.PENDING || withdrawal.getProcessedAt() != null) {
+            throw new RuntimeException("Withdrawal already processed or not awaiting confirmation");
+        }
+
+        if (!passwordEncoder.matches(req.getPassword(), user.getPassword())) {
+            throw new RuntimeException("Invalid password");
+        }
+
+        if (user.isTwoFactorEnabled()) {
+            if (req.getTwoFactorCode() == null || !req.getTwoFactorCode().matches("^[0-9]{6}$")) {
+                throw new RuntimeException("2FA code is required");
+            }
+            String secret = user.getTwoFactorSecret();
+            try {
+                int code = Integer.parseInt(req.getTwoFactorCode());
+                boolean ok = twoFactorAuthService.verifyCode(secret, code);
+                if (!ok) throw new RuntimeException("Invalid 2FA code");
+            } catch (NumberFormatException e) {
+                throw new RuntimeException("Invalid 2FA code");
+            }
+        }
+
+        validateWithdrawalLimits(userId, withdrawal.getAmount());
+    BigDecimal available = pointsService.getAvailableBalance(userId);
+        if (available.compareTo(withdrawal.getAmount()) < 0) {
+            throw new RuntimeException("Insufficient available balance. Available: " + available + " USDT");
+        }
+
+    pointsService.lockPointsForWithdrawal(userId, withdrawal.getAmount(), withdrawal.getId().toString());
+
+        withdrawal.setProcessedAt(LocalDateTime.now());
+        withdrawalRepository.save(withdrawal);
+        if (confirmQueueDelaySeconds > 0) {
+            withdrawalQueueService.addToQueueWithDelay(withdrawal.getId(), (int) confirmQueueDelaySeconds);
+        } else {
+            withdrawalQueueService.addToQueue(withdrawal.getId());
+        }
+
+        log.info("Withdrawal CONFIRMED (locked only) & ENQUEUED with delay {}s: ID={}, Amount={}",
+            confirmQueueDelaySeconds, withdrawal.getId(), withdrawal.getAmount());
+
+        return Map.of(
+            "withdrawalId", withdrawal.getId(),
+            "status", withdrawal.getStatus(),
+            "amount", withdrawal.getAmount(),
+            "fee", withdrawal.getFee(),
+            "netAmount", withdrawal.getNetAmount(),
+            "message", "Withdrawal confirmed and queued. You can still cancel while status is PENDING until processing begins.",
+            "cancelWindowSeconds", confirmQueueDelaySeconds
+        );
+    }
+
+    
+    public Map<String, Object> getUserWithdrawalHistory(UUID userId, int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("createdAt").descending());
+        Page<WithdrawalTransaction> withdrawals = withdrawalRepository.findByUserIdOrderByCreatedAtDesc(userId, pageRequest);
+
+        List<Map<String, Object>> withdrawalList = withdrawals.getContent().stream()
+            .map(this::convertToDto)
+            .toList();
+
+        return Map.of(
+            "withdrawals", withdrawalList,
+            "totalElements", withdrawals.getTotalElements(),
+            "totalPages", withdrawals.getTotalPages(),
+            "currentPage", page,
+            "pageSize", size
+        );
+    }
+
+    
+    public Map<String, Object> getWithdrawalStatus(Long withdrawalId, UUID userId) {
+        WithdrawalTransaction withdrawal = withdrawalRepository.findByIdAndUserId(withdrawalId, userId)
+            .orElseThrow(() -> new RuntimeException("Withdrawal not found"));
+
+        return convertToDto(withdrawal);
+    }
+
+    
+    @Transactional
+    public boolean cancelWithdrawal(Long withdrawalId, UUID userId) {
+        WithdrawalTransaction withdrawal = withdrawalRepository.findByIdAndUserId(withdrawalId, userId)
+            .orElseThrow(() -> new RuntimeException("Withdrawal not found"));
+
+        boolean isPending = withdrawal.getStatus() == WithdrawalTransaction.WithdrawalStatus.PENDING;
+        boolean noTx = withdrawal.getTxHash() == null || withdrawal.getTxHash().isEmpty();
+        boolean withinWindow = true;
+        if (withdrawal.getProcessedAt() != null) {
+            withinWindow = LocalDateTime.now().isBefore(withdrawal.getProcessedAt().plusSeconds(confirmQueueDelaySeconds));
+        }
+
+        if (!(isPending && noTx && withinWindow)) {
+            throw new RuntimeException("Cannot cancel withdrawal in current state or window has elapsed");
+        }
+
+        withdrawal.setStatus(WithdrawalTransaction.WithdrawalStatus.CANCELLED);
+        withdrawalRepository.save(withdrawal);
+
+    pointsService.unlockPointsForWithdrawal(userId, withdrawalId.toString());
+
+        try {
+            withdrawalQueueService.removeFromQueues(withdrawalId);
+        } catch (Exception e) {
+            log.warn("Failed to remove withdrawal {} from queues on cancel: {}", withdrawalId, e.getMessage());
+        }
+
+        log.info("Withdrawal cancelled and unlocked: ID={}, Amount={}", withdrawalId, withdrawal.getAmount());
+        return true;
+    }
+
+    
+    public Map<String, Object> getWithdrawalLimits(UUID userId) {
+        BigDecimal dailyUsed = getDailyWithdrawalAmount(userId);
+        BigDecimal remainingDaily = dailyLimit.subtract(dailyUsed);
+
+        return Map.of(
+            "minAmount", minWithdrawalAmount,
+            "maxAmount", maxWithdrawalAmount,
+            "dailyLimit", dailyLimit,
+            "dailyUsed", dailyUsed,
+            "remainingDaily", remainingDaily.max(BigDecimal.ZERO),
+            "fixedFee", fixedFee,
+            "feePercentage", feePercentage.multiply(new BigDecimal("100")) + "%",
+            "confirmDelaySeconds", confirmQueueDelaySeconds
+        );
+    }
+
+    
+    private BigDecimal calculateFee(BigDecimal amount) {
+        BigDecimal percentageFee = amount.multiply(feePercentage);
+        return fixedFee.add(percentageFee).setScale(6, RoundingMode.HALF_UP);
+    }
+
+    
+    private void validateWithdrawalLimits(UUID userId, BigDecimal amount) {
+
+        if (amount.compareTo(minWithdrawalAmount) < 0) {
+            throw new RuntimeException("Minimum withdrawal amount is " + minWithdrawalAmount + " USDT");
+        }
+
+        if (amount.compareTo(maxWithdrawalAmount) > 0) {
+            throw new RuntimeException("Maximum withdrawal amount is " + maxWithdrawalAmount + " USDT");
+        }
+
+        BigDecimal dailyUsed = getDailyWithdrawalAmount(userId);
+        if (dailyUsed.add(amount).compareTo(dailyLimit) > 0) {
+            BigDecimal remaining = dailyLimit.subtract(dailyUsed);
+            throw new RuntimeException("Daily withdrawal limit exceeded. Remaining: " + remaining + " USDT");
+        }
+    }
+
+    
+    private BigDecimal getDailyWithdrawalAmount(UUID userId) {
+        LocalDateTime startOfDay = LocalDateTime.now().withHour(0).withMinute(0).withSecond(0).withNano(0);
+        LocalDateTime endOfDay = startOfDay.plusDays(1);
+
+        return withdrawalRepository.sumAmountByUserIdAndDateRange(userId, startOfDay, endOfDay)
+            .orElse(BigDecimal.ZERO);
+    }
+
+    
+    private Map<String, Object> convertToDto(WithdrawalTransaction withdrawal) {
+
+        Map<String, Object> dto = new java.util.HashMap<>();
+        dto.put("id", withdrawal.getId());
+        dto.put("toAddress", withdrawal.getToAddress());
+        dto.put("amount", withdrawal.getAmount());
+        dto.put("fee", withdrawal.getFee());
+        dto.put("netAmount", withdrawal.getNetAmount());
+        dto.put("status", withdrawal.getStatus());
+        dto.put("txHash", withdrawal.getTxHash() != null ? withdrawal.getTxHash() : "");
+        dto.put("confirmations", withdrawal.getConfirmations());
+        dto.put("createdAt", withdrawal.getCreatedAt());
+        dto.put("processedAt", withdrawal.getProcessedAt());
+        dto.put("confirmedAt", withdrawal.getConfirmedAt());
+        dto.put("failureReason", withdrawal.getFailureReason() != null ? withdrawal.getFailureReason() : "");
+
+        return dto;
+    }
+}
